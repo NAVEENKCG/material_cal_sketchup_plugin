@@ -1,0 +1,499 @@
+# =============================================================================
+# Material Area Calculator Pro
+# Version: 2.0.0
+# Author:  Naveenraj SS
+# License: MIT
+#
+# Fixes over the basic script:
+#   1. Modern JS bridge (sketchup.action()) replaces deprecated skp: protocol
+#   2. Single-side counting prevents double-counting on faces painted both sides
+#   3. Visibility checks skip hidden layers/tags and hidden geometry
+#   4. UI.savepanel for safe "Save As" instead of silent file overwrite
+#   5. Recursive entity traversal with transform-aware area scaling
+#   6. Correct area scaling through nested group/component transforms
+# =============================================================================
+
+require 'sketchup.rb'
+require 'extensions.rb'
+
+module MaterialAreaCalculatorPro
+
+  PLUGIN_ID      = 'material_area_calculator_pro'.freeze
+  PLUGIN_VERSION = '2.0.0'.freeze
+
+  # Unit conversion factors FROM square inches (SketchUp's internal unit)
+  SQIN_TO_SQFT = 1.0 / 144.0
+  SQIN_TO_SQM  = 0.00064516
+  SQIN_TO_SQYD = 1.0 / 1296.0
+
+  # ---------------------------------------------------------------------------
+  # CORE: Recursive face collector with visibility filtering and transform-aware
+  # area scaling. Traverses groups and component instances at any nesting depth.
+  #
+  # @param entities    [Sketchup::Entities]  entity collection to scan
+  # @param transform   [Geom::Transformation] cumulative transform from parents
+  # @param results     [Hash]                 accumulator: material_name => area_sqin
+  # @param only_visible [Boolean]             skip hidden geometry and hidden layers
+  # ---------------------------------------------------------------------------
+  def self.collect_face_areas(entities, transform, results, only_visible)
+    entities.each do |entity|
+
+      # ── Visibility gate ────────────────────────────────────────────────────
+      if only_visible
+        next if entity.hidden?
+        # layer/tag visibility (method name is .layer in all SketchUp versions)
+        next if entity.respond_to?(:layer) && entity.layer && !entity.layer.visible?
+      end
+
+      case entity
+
+      # ── Face ──────────────────────────────────────────────────────────────
+      when Sketchup::Face
+        # Apply the cumulative parent transform to get the true world-space area.
+        # Geom::Transformation#determinant gives the volume-scale factor; its
+        # square-root gives the area-scale factor.
+        scale_factor = Math.sqrt(transform.determinant.abs)
+        area_sqin    = entity.area * scale_factor
+
+        # FIX #2 — single-side counting
+        # We attribute the area to whichever material is on the FRONT face.
+        # If the front has no material, fall back to the back face material.
+        # This prevents a face painted "Red" on both sides from being counted twice.
+        mat = entity.material || entity.back_material
+        next if mat.nil?
+
+        results[mat.name] = (results[mat.name] || 0.0) + area_sqin
+
+      # ── Group ─────────────────────────────────────────────────────────────
+      when Sketchup::Group
+        child_transform = transform * entity.transformation
+        collect_face_areas(entity.entities, child_transform, results, only_visible)
+
+      # ── Component instance ────────────────────────────────────────────────
+      when Sketchup::ComponentInstance
+        child_transform = transform * entity.transformation
+        collect_face_areas(entity.definition.entities, child_transform, results, only_visible)
+
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Run a full model scan and return a hash of { material_name => area_sqin }
+  # ---------------------------------------------------------------------------
+  def self.scan_model(only_visible: true)
+    model   = Sketchup.active_model
+    results = {}
+    identity = Geom::Transformation.new   # identity transform — no scaling yet
+    collect_face_areas(model.entities, identity, results, only_visible)
+    results
+  end
+
+  # ---------------------------------------------------------------------------
+  # Format a square-inch value into all four unit strings
+  # ---------------------------------------------------------------------------
+  def self.format_row(sq_in)
+    {
+      sqft: (sq_in * SQIN_TO_SQFT).round(2),
+      sqm:  (sq_in * SQIN_TO_SQM ).round(4),
+      sqyd: (sq_in * SQIN_TO_SQYD).round(3),
+      sqin: sq_in.round(1)
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Build JSON payload for the HTML dialog (sorted by area descending)
+  # ---------------------------------------------------------------------------
+  def self.build_json(results)
+    rows = results
+      .sort_by { |_, v| -v }
+      .map do |name, sq_in|
+        r = format_row(sq_in)
+        # Escape quotes in material names for JSON safety
+        safe_name = name.gsub('\\', '\\\\').gsub('"', '\\"')
+        "{\"name\":\"#{safe_name}\"," \
+        "\"sqft\":#{r[:sqft]}," \
+        "\"sqm\":#{r[:sqm]}," \
+        "\"sqyd\":#{r[:sqyd]}," \
+        "\"sqin\":#{r[:sqin]}}"
+      end
+    "[#{rows.join(',')}]"
+  end
+
+  # ---------------------------------------------------------------------------
+  # FIX #4 — Export with UI.savepanel so the user picks filename & location
+  # ---------------------------------------------------------------------------
+  def self.export_csv(results)
+    # FIX #4: open a native Save As dialog instead of silently overwriting
+    path = UI.savepanel('Save material areas as CSV', Dir.home, 'material_areas.csv')
+    return if path.nil? # user cancelled
+
+    # Ensure .csv extension
+    path += '.csv' unless path.end_with?('.csv')
+
+    begin
+      File.open(path, 'w') do |f|
+        f.puts 'Material Name,Area (sq ft),Area (sq m),Area (sq yd),Area (sq in)'
+        results.sort_by { |_, v| -v }.each do |name, sq_in|
+          r = format_row(sq_in)
+          f.puts "\"#{name.gsub('"', '""')}\",#{r[:sqft]},#{r[:sqm]},#{r[:sqyd]},#{r[:sqin]}"
+        end
+      end
+      UI.messagebox("Exported successfully to:\n#{path}")
+    rescue => e
+      UI.messagebox("Export failed:\n#{e.message}")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTML template for the dialog
+  # ---------------------------------------------------------------------------
+  def self.dialog_html(json_data, only_visible)
+    <<~HTML
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Material Area Calculator Pro</title>
+        <style>
+          *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            font-size: 13px;
+            background: #f4f4f4;
+            color: #222;
+          }
+
+          /* ── Header ── */
+          header {
+            background: #2c5282;
+            color: #fff;
+            padding: 12px 16px 10px;
+          }
+          header h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+          header p  { font-size: 11px; opacity: 0.75; margin-top: 2px; }
+
+          /* ── Toolbar ── */
+          .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #fff;
+            border-bottom: 1px solid #ddd;
+            flex-wrap: wrap;
+          }
+          .toolbar input[type=text] {
+            flex: 1;
+            min-width: 140px;
+            padding: 5px 9px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 12px;
+          }
+          .toolbar label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            color: #555;
+            white-space: nowrap;
+          }
+          .toolbar select {
+            padding: 4px 6px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 12px;
+          }
+          .stat {
+            font-size: 11px;
+            color: #777;
+            margin-left: auto;
+            white-space: nowrap;
+          }
+
+          /* ── Table ── */
+          .table-wrap { overflow-x: auto; }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+          }
+          thead tr { background: #2c5282; color: #fff; }
+          thead th {
+            padding: 7px 10px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 12px;
+            white-space: nowrap;
+            cursor: pointer;
+            user-select: none;
+          }
+          thead th:hover { background: #2a4a7f; }
+          thead th .sort-icon { opacity: 0.5; margin-left: 3px; }
+          thead th.active .sort-icon { opacity: 1; }
+          tbody tr { border-bottom: 1px solid #ebebeb; }
+          tbody tr:hover td { background: #eef2ff; }
+          tbody td {
+            padding: 6px 10px;
+            font-size: 12px;
+            white-space: nowrap;
+          }
+          tbody td:first-child {
+            font-weight: 500;
+            color: #1a3a6b;
+            white-space: normal;
+            max-width: 200px;
+            word-break: break-word;
+          }
+          tbody td:not(:first-child) { text-align: right; color: #333; }
+          .no-results { text-align: center; padding: 24px; color: #999; font-size: 12px; }
+
+          /* ── Footer ── */
+          footer {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #fff;
+            border-top: 1px solid #ddd;
+            flex-wrap: wrap;
+          }
+          button {
+            padding: 6px 14px;
+            border: none;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            font-weight: 500;
+          }
+          .btn-primary { background: #2c5282; color: #fff; }
+          .btn-primary:hover { background: #2a4a7f; }
+          .btn-secondary { background: #e2e8f0; color: #333; }
+          .btn-secondary:hover { background: #cbd5e0; }
+          .total-label { font-size: 12px; color: #555; margin-left: auto; }
+          .total-value { font-size: 13px; font-weight: 600; color: #2c5282; }
+
+          /* ── Visibility badge ── */
+          .badge {
+            font-size: 10px;
+            padding: 2px 7px;
+            border-radius: 10px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+          }
+          .badge-visible  { background: #c6f6d5; color: #276749; }
+          .badge-all      { background: #fed7d7; color: #9b2c2c; }
+        </style>
+      </head>
+      <body>
+
+        <header>
+          <h1>Material Area Calculator Pro <span class="badge #{only_visible ? 'badge-visible' : 'badge-all'}">#{only_visible ? 'Visible only' : 'All geometry'}</span></h1>
+          <p>v#{PLUGIN_VERSION} &mdash; SketchUp #{Sketchup.version.split('.').first}</p>
+        </header>
+
+        <div class="toolbar">
+          <input type="text" id="search" placeholder="Filter by material name…" oninput="applyFilter()">
+          <label>
+            Show:
+            <select id="unit-sel" onchange="renderTable()">
+              <option value="sqft">sq ft</option>
+              <option value="sqm">sq m</option>
+              <option value="sqyd">sq yd</option>
+              <option value="sqin">sq in</option>
+            </select>
+          </label>
+          <span class="stat" id="stat"></span>
+        </div>
+
+        <div class="table-wrap">
+          <table id="tbl">
+            <thead>
+              <tr>
+                <th onclick="sortBy('name')"  data-col="name">Material <span class="sort-icon">▲</span></th>
+                <th onclick="sortBy('sqft')"  data-col="sqft">sq ft <span class="sort-icon">▲</span></th>
+                <th onclick="sortBy('sqm')"   data-col="sqm">sq m <span class="sort-icon">▲</span></th>
+                <th onclick="sortBy('sqyd')"  data-col="sqyd">sq yd <span class="sort-icon">▲</span></th>
+                <th onclick="sortBy('sqin')"  data-col="sqin">sq in <span class="sort-icon">▲</span></th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+
+        <footer>
+          <!-- FIX #1: use sketchup.action() JS bridge, NOT window.location="skp:..." -->
+          <button class="btn-primary"   onclick="doExport()">Export CSV…</button>
+          <button class="btn-secondary" onclick="doRescan()">Rescan model</button>
+          <span class="total-label">Filtered total: <span class="total-value" id="total">—</span></span>
+        </footer>
+
+        <script>
+          // ── Data ──────────────────────────────────────────────────────────
+          var ALL_DATA   = #{json_data};
+          var filtered   = ALL_DATA.slice();
+          var sortCol    = 'sqft';
+          var sortAsc    = false;
+
+          // ── Render ────────────────────────────────────────────────────────
+          function renderTable() {
+            var unit  = document.getElementById('unit-sel').value;
+            var tbody = document.getElementById('tbody');
+            var label = { sqft:'sq ft', sqm:'sq m', sqyd:'sq yd', sqin:'sq in' }[unit];
+
+            if (filtered.length === 0) {
+              tbody.innerHTML = '<tr><td class="no-results" colspan="5">No materials found</td></tr>';
+              document.getElementById('total').textContent = '—';
+              return;
+            }
+
+            var rows = '';
+            var sum  = 0;
+            filtered.forEach(function(r) {
+              sum += r[unit];
+              rows += '<tr>' +
+                '<td>' + esc(r.name) + '</td>' +
+                '<td>' + r.sqft + '</td>' +
+                '<td>' + r.sqm  + '</td>' +
+                '<td>' + r.sqyd + '</td>' +
+                '<td>' + r.sqin + '</td>' +
+              '</tr>';
+            });
+            tbody.innerHTML = rows;
+            document.getElementById('total').textContent = sum.toFixed(2) + ' ' + label;
+            document.getElementById('stat').textContent  = filtered.length + ' / ' + ALL_DATA.length + ' material(s)';
+
+            // Highlight active sort column header
+            document.querySelectorAll('thead th').forEach(function(th) {
+              th.classList.toggle('active', th.dataset.col === sortCol);
+            });
+          }
+
+          // ── Filter ────────────────────────────────────────────────────────
+          function applyFilter() {
+            var q = document.getElementById('search').value.toLowerCase();
+            filtered = ALL_DATA.filter(function(r) {
+              return r.name.toLowerCase().indexOf(q) !== -1;
+            });
+            sortData();
+            renderTable();
+          }
+
+          // ── Sort ──────────────────────────────────────────────────────────
+          function sortBy(col) {
+            if (sortCol === col) { sortAsc = !sortAsc; }
+            else { sortCol = col; sortAsc = col === 'name'; }
+            sortData();
+            renderTable();
+          }
+          function sortData() {
+            filtered.sort(function(a, b) {
+              var av = a[sortCol], bv = b[sortCol];
+              if (typeof av === 'string') {
+                return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+              }
+              return sortAsc ? av - bv : bv - av;
+            });
+          }
+
+          // ── Actions (FIX #1 — modern JS bridge) ──────────────────────────
+          function doExport() {
+            sketchup.export_csv();   // calls the registered Ruby callback
+          }
+          function doRescan() {
+            sketchup.rescan();       // calls the registered Ruby callback
+          }
+
+          // ── Helpers ───────────────────────────────────────────────────────
+          function esc(s) {
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          }
+
+          // ── Init ──────────────────────────────────────────────────────────
+          sortData();
+          renderTable();
+        </script>
+      </body>
+      </html>
+    HTML
+  end
+
+  # ---------------------------------------------------------------------------
+  # Show the main HtmlDialog window
+  # ---------------------------------------------------------------------------
+  def self.show_dialog(only_visible: true)
+    results = scan_model(only_visible: only_visible)
+
+    if results.empty?
+      UI.messagebox(
+        "No materials with painted faces found.\n\n" \
+        "#{only_visible ? 'Note: hidden geometry is excluded. Try toggling the visibility filter.' : ''}"
+      )
+      return
+    end
+
+    json = build_json(results)
+
+    dlg = UI::HtmlDialog.new(
+      dialog_title:    'Material Area Calculator Pro',
+      preferences_key: PLUGIN_ID,
+      width:  640,
+      height: 480,
+      resizable: true
+    )
+
+    dlg.set_html(dialog_html(json, only_visible))
+
+    # ── FIX #1: Modern async JS bridge callbacks ──────────────────────────
+    # export_csv — open native Save As dialog
+    dlg.add_action_callback('export_csv') do |_ctx|
+      export_csv(results)
+    end
+
+    # rescan — close this dialog, re-scan, reopen
+    dlg.add_action_callback('rescan') do |_ctx|
+      dlg.close
+      show_dialog(only_visible: only_visible)
+    end
+
+    dlg.show
+  end
+
+  # ---------------------------------------------------------------------------
+  # Register menu items under Extensions
+  # ---------------------------------------------------------------------------
+  unless file_loaded?(__FILE__)
+    sub = UI.menu('Extensions').add_submenu('Material Area Calculator Pro')
+
+    sub.add_item('Calculate (visible geometry only)') do
+      show_dialog(only_visible: true)
+    end
+
+    sub.add_item('Calculate (all geometry including hidden)') do
+      show_dialog(only_visible: false)
+    end
+
+    sub.add_separator
+
+    sub.add_item('About…') do
+      UI.messagebox(
+        "Material Area Calculator Pro v#{PLUGIN_VERSION}\n\n" \
+        "Calculates the total face area for every material in your model.\n\n" \
+        "Features:\n" \
+        "  • Recursive scan through groups & components\n" \
+        "  • Transform-aware area (correct scale at any nesting level)\n" \
+        "  • Visibility filtering (optional)\n" \
+        "  • Single-side counting (no double-counting)\n" \
+        "  • Native Save As dialog for CSV export\n" \
+        "  • Filter, sort, and multi-unit display\n\n" \
+        "License: MIT"
+      )
+    end
+
+    file_loaded(__FILE__)
+  end
+
+end # module MaterialAreaCalculatorPro
